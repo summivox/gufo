@@ -108,6 +108,9 @@ void ReferenceModel::Mat::Row(std::uint64_t row, float* out) const {
     case GgmlType::kQ8_0:
       gufo::quant::DequantizeQ8_0(src, out, cols);
       break;
+    case GgmlType::kIQ4_NL:
+      gufo::quant::DequantizeIQ4_NL(src, out, cols);
+      break;
     case GgmlType::kNVFP4:
       DeqNvfp4(src, out, cols);
       break;
@@ -150,6 +153,9 @@ ReferenceModel::Mat ReferenceModel::M(const std::string& name) const {
       break;
     case GgmlType::kQ8_0:
       m.row_bytes = m.cols / 32 * 34;
+      break;
+    case GgmlType::kIQ4_NL:
+      m.row_bytes = m.cols / 32 * 18;
       break;
     default:
       m.row_bytes = m.cols / kNvfp4Block * kNvfp4Bytes;
@@ -261,8 +267,19 @@ Vec ReferenceModel::Control(const Vec& cur, const Vec& message,
   Rms(b, nullptr, kMixEps);
   std::copy(a.begin(), a.end(), gate.begin());
   std::copy(b.begin(), b.end(), gate.begin() + h);
-  const std::string base =
-      "blk." + std::to_string(phys) + ".loop_" + group + "_";
+  std::string base = "blk." + std::to_string(phys) + ".loop_" + group + "_";
+  if (!reader_->HasTensor(base + "down.weight")) {
+    const char* mapped = group;
+    if (std::strcmp(group, "attn") == 0)
+      mapped = "q_ctrl";
+    else if (std::strcmp(group, "k") == 0)
+      mapped = "k_ctrl";
+    else if (std::strcmp(group, "v") == 0)
+      mapped = "v_ctrl";
+    else if (std::strcmp(group, "mlp") == 0)
+      mapped = "ffn_ctrl";
+    base = "blk." + std::to_string(phys) + ".loop_" + mapped + "_";
+  }
   Vec low(rank);
   M(base + "down.weight").MatVec(gate.data(), low.data(), 0, rank);
   Vec gain(h);
@@ -554,16 +571,20 @@ const Vec& ReferenceModel::Evaluate(Session& s, std::int32_t token) const {
         cur = Layer(il, ip, cur, blocks, nullptr, s, pos);
         continue;
       }
-      // message queries: attn/ffn from loop_res_query, k/v from
-      // loop_kv_res_query (column pairs per core layer)
-      const std::uint32_t c = ip - start;
-      const Vec res = F("loop_res_query.weight");
-      const Vec kv = F("loop_kv_res_query.weight");
       Vec mq(4 * h);
-      std::copy_n(res.begin() + (2 * c) * h, h, mq.begin());
-      std::copy_n(kv.begin() + (2 * c) * h, h, mq.begin() + h);
-      std::copy_n(kv.begin() + (2 * c + 1) * h, h, mq.begin() + 2 * h);
-      std::copy_n(res.begin() + (2 * c + 1) * h, h, mq.begin() + 3 * h);
+      if (reader_->HasTensor(P(ip, "loop_msg_query.weight"))) {
+        mq = F(P(ip, "loop_msg_query.weight"));
+      } else {
+        // message queries: attn/ffn from loop_res_query, k/v from
+        // loop_kv_res_query (column pairs per core layer)
+        const std::uint32_t c = ip - start;
+        const Vec res = F("loop_res_query.weight");
+        const Vec kv = F("loop_kv_res_query.weight");
+        std::copy_n(res.begin() + (2 * c) * h, h, mq.begin());
+        std::copy_n(kv.begin() + (2 * c) * h, h, mq.begin() + h);
+        std::copy_n(kv.begin() + (2 * c + 1) * h, h, mq.begin() + 2 * h);
+        std::copy_n(res.begin() + (2 * c + 1) * h, h, mq.begin() + 3 * h);
+      }
       const Vec m = Mix(bank, bank_out, mq.data(), 4);
       std::vector<Vec> msgs(4);
       for (std::uint32_t j = 0; j < 4; ++j)

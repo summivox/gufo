@@ -5805,7 +5805,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                 error, max_context, session_count, prefill_policy,
                 scheduler_policy);
   }
-  if (reader->GetMetadataString("general.architecture") == "inkling2") {
+  if (const auto arch = reader->GetMetadataString("general.architecture");
+      arch == "inkling2" || arch == "inkling2_loop") {
     if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
         speculative_config.backend != TextSpeculativeBackend::kDSpark) {
       SetError(error, "Inkling speculation over serve supports dspark only");

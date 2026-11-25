@@ -40,6 +40,7 @@ constexpr int kTypeF32 = 0;
 constexpr int kTypeBf16 = 1;
 constexpr int kTypeQ8 = 2;
 constexpr int kTypeNvfp4 = 3;
+constexpr int kTypeIq4Nl = 4;
 
 #define HIP_OK(expr)                                             \
   do {                                                           \
@@ -53,6 +54,8 @@ constexpr int kTypeNvfp4 = 3;
 
 __constant__ float kE2m1[16] = {0, 1,  2,  3,  4,  6,  8,  12,
                                 0, -1, -2, -3, -4, -6, -8, -12};
+__constant__ signed char kIq4NlTable[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 
 __device__ float Ue4m3(unsigned char x) {
   if (x == 0 || x == 0x7F)
@@ -102,6 +105,14 @@ __device__ void Load32(const unsigned char* row, int chunk, float* w,
         }
       }
     }
+  } else if constexpr (TY == kTypeIq4Nl) {
+    const unsigned char* blk = row + static_cast<std::size_t>(chunk) * 18;
+    const float d = __half2float(*reinterpret_cast<const __half*>(blk));
+    for (int j = 0; j < 16; ++j) {
+      const unsigned char b = blk[2 + j];
+      w[j] = d * static_cast<float>(kIq4NlTable[b & 15]);
+      w[16 + j] = d * static_cast<float>(kIq4NlTable[b >> 4]);
+    }
   } else {
     for (int s2 = 0; s2 < 2; ++s2) {
       const int sb = chunk * 2 + s2;
@@ -143,6 +154,33 @@ __device__ __forceinline__ unsigned int Nib4(unsigned int n) {
   const unsigned int neg = __builtin_amdgcn_perm(0xF4F8FAFCU, 0xFDFEFF00U, mag);
   const unsigned int m = ((n >> 3) & 0x01010101U) * 0xFFU;
   return (neg & m) | (pos & ~m);
+}
+
+// Four IQ4_NL nibbles (one per byte, 0..15) -> four signed int8 codebook values
+__device__ __forceinline__ unsigned int Iq4Nl4(unsigned int n) {
+  constexpr unsigned int kT0 = 0xBFAD9881U;  // -127, -104, -83, -65
+  constexpr unsigned int kT1 = 0xF6EADDCFU;  //  -49,  -35, -22, -10
+  constexpr unsigned int kT2 = 0x26190D01U;  //    1,   13,  25,  38
+  constexpr unsigned int kT3 = 0x71594535U;  //   53,   69,  89, 113
+  const unsigned int sel = n & 0x07070707U;
+  const unsigned int lo = __builtin_amdgcn_perm(kT1, kT0, sel);
+  const unsigned int hi = __builtin_amdgcn_perm(kT3, kT2, sel);
+  const unsigned int mask = ((n >> 3) & 0x01010101U) * 0xFFU;
+  return (hi & mask) | (lo & ~mask);
+}
+
+__device__ __forceinline__ uint4 LoadUint4Unaligned2(const unsigned char* p) {
+  const auto* h = reinterpret_cast<const unsigned short*>(p);
+  uint4 r;
+  r.x =
+      static_cast<unsigned int>(h[0]) | (static_cast<unsigned int>(h[1]) << 16);
+  r.y =
+      static_cast<unsigned int>(h[2]) | (static_cast<unsigned int>(h[3]) << 16);
+  r.z =
+      static_cast<unsigned int>(h[4]) | (static_cast<unsigned int>(h[5]) << 16);
+  r.w =
+      static_cast<unsigned int>(h[6]) | (static_cast<unsigned int>(h[7]) << 16);
+  return r;
 }
 
 // x rows -> int8 per 32-block (scale = amax / 127)
@@ -208,6 +246,20 @@ __global__ void GemmDp4(const unsigned char* w, std::size_t row_bytes, int cols,
       a = Dot4(w1.z, x1.z, a);
       a = Dot4(w1.w, x1.w, a);
       acc += static_cast<float>(a) * d * xsp[u];
+    } else if constexpr (TY == kTypeIq4Nl) {
+      const unsigned char* blk = row + static_cast<std::size_t>(u) * 18;
+      const float d = __half2float(*reinterpret_cast<const __half*>(blk));
+      const uint4 q = LoadUint4Unaligned2(blk + 2);
+      const unsigned int lo = 0x0F0F0F0FU;
+      int s = Dot4(Iq4Nl4(q.x & lo), x0.x, 0);
+      s = Dot4(Iq4Nl4(q.y & lo), x0.y, s);
+      s = Dot4(Iq4Nl4(q.z & lo), x0.z, s);
+      s = Dot4(Iq4Nl4(q.w & lo), x0.w, s);
+      s = Dot4(Iq4Nl4((q.x >> 4) & lo), x1.x, s);
+      s = Dot4(Iq4Nl4((q.y >> 4) & lo), x1.y, s);
+      s = Dot4(Iq4Nl4((q.z >> 4) & lo), x1.z, s);
+      s = Dot4(Iq4Nl4((q.w >> 4) & lo), x1.w, s);
+      acc += static_cast<float>(s) * d * xsp[u];
     } else {
       const uint4 q = *reinterpret_cast<const uint4*>(row + u * 16);
       const float d0 = Ue4m3(row[(cols >> 1) + u * 2]);
@@ -1155,6 +1207,15 @@ __device__ void LoadB16(const unsigned char* row, int k0, __half* dst,
                                  (u[i] >> (8 * k)) & 0xFF)));
       }
     }
+  } else if constexpr (TY == kTypeIq4Nl) {
+    const unsigned char* blk = row + static_cast<std::size_t>(k0 >> 5) * 18;
+    const float d = __half2float(*reinterpret_cast<const __half*>(blk));
+    const bool hi = (k0 & 16) != 0;
+    for (int j = 0; j < 16; ++j) {
+      const unsigned char b = blk[2 + j];
+      const unsigned int code = hi ? (b >> 4) : (b & 15);
+      dst[j] = __float2half(d * static_cast<float>(kIq4NlTable[code]));
+    }
   } else {
     const int sb = k0 >> 4;
     const float d = Ue4m3(row[(cols >> 1) + sb]);
@@ -2048,6 +2109,21 @@ struct ModelState {
   std::string P(std::uint32_t il, const char* s) const {
     return "blk." + std::to_string(il) + "." + s;
   }
+  std::string LoopCtrlBase(std::uint32_t phys, const char* group) const {
+    std::string base = "blk." + std::to_string(phys) + ".loop_" + group + "_";
+    if (Has(base + "down.weight"))
+      return base;
+    const char* mapped = group;
+    if (std::strcmp(group, "attn") == 0)
+      mapped = "q_ctrl";
+    else if (std::strcmp(group, "k") == 0)
+      mapped = "k_ctrl";
+    else if (std::strcmp(group, "v") == 0)
+      mapped = "v_ctrl";
+    else if (std::strcmp(group, "mlp") == 0)
+      mapped = "ffn_ctrl";
+    return "blk." + std::to_string(phys) + ".loop_" + mapped + "_";
+  }
   std::uint32_t Phys(std::uint32_t slot) const {
     if (slot < n_phys)
       return slot;
@@ -2139,6 +2215,9 @@ std::shared_ptr<Model> Model::Load(const std::string& path,
         break;
       case GgmlType::kQ8_0:
         t.type = kTypeQ8;
+        break;
+      case GgmlType::kIQ4_NL:
+        t.type = kTypeIq4Nl;
         break;
       case GgmlType::kNVFP4:
         t.type = kTypeNvfp4;
@@ -2933,6 +3012,9 @@ struct Session::Impl : Scratch {
           case kTypeQ8:
             WmmaGemm<kTypeQ8><<<wg, kWmmaThreads, 0, stream>>>(wa);
             return;
+          case kTypeIq4Nl:
+            WmmaGemm<kTypeIq4Nl><<<wg, kWmmaThreads, 0, stream>>>(wa);
+            return;
           default:
             break;
         }
@@ -2954,6 +3036,10 @@ struct Session::Impl : Scratch {
         GemmDense<kTypeQ8><<<grid, kThreads * 2, 0, stream>>>(
             wp, w.row_bytes, w.cols, nrows, xin, ldx, yout, ldy, n);
         break;
+      case kTypeIq4Nl:
+        GemmDense<kTypeIq4Nl><<<grid, kThreads * 2, 0, stream>>>(
+            wp, w.row_bytes, w.cols, nrows, xin, ldx, yout, ldy, n);
+        break;
       default:
         std::abort();
     }
@@ -2972,6 +3058,11 @@ struct Session::Impl : Scratch {
             static_cast<const unsigned char*>(w.dev), w.row_bytes,
             static_cast<int>(w.cols), rows, ids_flat, xrow, scale, xq, xqs,
             yout);
+      } else if (w.type == kTypeIq4Nl) {
+        GemmDp4<kTypeIq4Nl><<<g8, kThreads * 2, 0, stream>>>(
+            static_cast<const unsigned char*>(w.dev), w.row_bytes,
+            static_cast<int>(w.cols), rows, ids_flat, xrow, scale, xq, xqs,
+            yout);
       } else {
         GemmDp4<kTypeQ8><<<g8, kThreads * 2, 0, stream>>>(
             static_cast<const unsigned char*>(w.dev), w.row_bytes,
@@ -2985,6 +3076,9 @@ struct Session::Impl : Scratch {
     const auto* wp = static_cast<const unsigned char*>(w.dev);
     if (w.type == kTypeNvfp4) {
       GemmRouted<kTypeNvfp4><<<grid, kThreads * 2, 0, stream>>>(
+          wp, w.row_bytes, w.cols, rows, ids_flat, xrow, scale, xin, yout);
+    } else if (w.type == kTypeIq4Nl) {
+      GemmRouted<kTypeIq4Nl><<<grid, kThreads * 2, 0, stream>>>(
           wp, w.row_bytes, w.cols, rows, ids_flat, xrow, scale, xin, yout);
     } else {
       GemmRouted<kTypeQ8><<<grid, kThreads * 2, 0, stream>>>(
@@ -3025,25 +3119,22 @@ struct Session::Impl : Scratch {
                    const char* group, int n) {
     const int h = static_cast<int>(m->config.hidden_size);
     const bool big = n >= kWmmaMinTokens;
+    const std::string base = m->LoopCtrlBase(phys, group);
     if (!big && m->config.loop_gate_rank == kControlRank) {
-      const std::string fb =
-          "blk." + std::to_string(phys) + ".loop_" + group + "_";
       ControlLow<<<dim3(n, kControlRank / kControlWaves), kControlWaves * 32, 0,
                    stream>>>(
           cur_, message,
-          static_cast<const float*>(m->T(fb + "down.weight").dev), h,
+          static_cast<const float*>(m->T(base + "down.weight").dev), h,
           m->config.rms_eps, low);
       ControlApply<<<dim3(n, (h + 255) / 256), 256, 0, stream>>>(
           cur_, message, low,
-          static_cast<const float*>(m->T(fb + "gain.weight").dev),
-          static_cast<const float*>(m->T(fb + "forget.weight").dev), h);
+          static_cast<const float*>(m->T(base + "gain.weight").dev),
+          static_cast<const float*>(m->T(base + "forget.weight").dev), h);
       return;
     }
     RmsRows(cur_, nullptr, cat, n, h, h, 2 * h, big ? cath : nullptr);
     RmsRows(message, nullptr, cat + h, n, h, h, 2 * h,
             big ? cath + h : nullptr);
-    const std::string base =
-        "blk." + std::to_string(phys) + ".loop_" + group + "_";
     Dense(m->T(base + "down.weight"), cat, 2 * h, low, m->config.loop_gate_rank,
           n, -1, big ? cath : nullptr);
     Dense(m->T(base + "gain.weight"), low, m->config.loop_gate_rank, gain, h,
@@ -3748,12 +3839,13 @@ struct Session::Impl : Scratch {
                                   m->T(m->P(p, "ffn_down_exps.scale")).dev)
                             : nullptr;
     const int items = n * nu;
+    const Tensor& wgu = m->T(m->P(p, "ffn_gate_up_exps.weight"));
+    const Tensor& wdn = m->T(m->P(p, "ffn_down_exps.weight"));
     if (n >= kWmmaMinTokens &&
-        m->T(m->P(p, "ffn_gate_up_exps.weight")).type == kTypeNvfp4 &&
+        (wgu.type == kTypeNvfp4 || wgu.type == kTypeIq4Nl) &&
+        (wdn.type == kTypeNvfp4 || wdn.type == kTypeIq4Nl) &&
         std::getenv("INKLING_OWN_EXPERTS") == nullptr) {
       namespace qfn = gufo::models::qwen38_flash_next::rocm;
-      const Tensor& wgu = m->T(m->P(p, "ffn_gate_up_exps.weight"));
-      const Tensor& wdn = m->T(m->P(p, "ffn_down_exps.weight"));
       HIP_OK(hipMemsetAsync(rcounts, 0, ne * sizeof(unsigned int), stream));
       CountExperts<<<(items + 255) / 256, 256, 0, stream>>>(ids, items,
                                                             rcounts);
@@ -3768,14 +3860,26 @@ struct Session::Impl : Scratch {
       const int bn = n >= 2048 ? 192 : (n >= 512 ? 128 : 48);
       int ntiles = 0;
       const int* tmap = TileMap(n, bn, &ntiles);
-      const bool ok1 = qfn::RoutedNvfp4GemmF16(wgu.dev, xmoe, tmap, ntiles, bn,
-                                               rbounds, rrows_token, rrows_slot,
-                                               gu16, 2 * ff, h, s_gu, stream);
+      const bool ok1 =
+          wgu.type == kTypeNvfp4
+              ? qfn::RoutedNvfp4GemmF16(wgu.dev, xmoe, tmap, ntiles, bn,
+                                        rbounds, rrows_token, rrows_slot, gu16,
+                                        2 * ff, h, s_gu, stream)
+              : qfn::RoutedF16Gemm(wgu.dev, qfn::WeightType::kIQ4_NL, xmoe,
+                                   tmap, ntiles, bn, rbounds, rrows_token,
+                                   rrows_slot, nullptr, nullptr, gu16, 2 * ff,
+                                   h, stream);
       SituHalfIn<<<items, 256, 0, stream>>>(gu16, act16, ff, c.situ_beta,
                                             c.situ_linear_beta);
-      const bool ok2 = qfn::RoutedNvfp4GemmF16(wdn.dev, act16, tmap, ntiles, bn,
-                                               rbounds, rrows_slot, rrows_slot,
-                                               y16, h, ff, s_dn, stream);
+      const bool ok2 =
+          wdn.type == kTypeNvfp4
+              ? qfn::RoutedNvfp4GemmF16(wdn.dev, act16, tmap, ntiles, bn,
+                                        rbounds, rrows_slot, rrows_slot, y16, h,
+                                        ff, s_dn, stream)
+              : qfn::RoutedF16Gemm(wdn.dev, qfn::WeightType::kIQ4_NL, act16,
+                                   tmap, ntiles, bn, rbounds, rrows_slot,
+                                   rrows_slot, nullptr, nullptr, y16, h, ff,
+                                   stream);
       if (!ok1 || !ok2) {
         std::fprintf(stderr,
                      "inkling: shared routed gemm rejected the launch\n");
@@ -3788,8 +3892,6 @@ struct Session::Impl : Scratch {
       const int max_tiles = items / kTileM + ne;
       SortItems<<<1, 1024, 0, stream>>>(ids, items, ne, sorted, tiles,
                                         max_tiles);
-      const Tensor& wgu = m->T(m->P(p, "ffn_gate_up_exps.weight"));
-      const Tensor& wdn = m->T(m->P(p, "ffn_down_exps.weight"));
       ToHalf<<<(static_cast<std::size_t>(n) * h + 255) / 256, 256, 0, stream>>>(
           x, xh, static_cast<std::size_t>(n) * h);
       WmmaArgs a1{static_cast<const unsigned char*>(wgu.dev),
@@ -3818,6 +3920,8 @@ struct Session::Impl : Scratch {
       const dim3 g2(h / kTileN, max_tiles);
       if (wgu.type == kTypeNvfp4) {
         WmmaGemm<kTypeNvfp4><<<g1, kWmmaThreads, 0, stream>>>(a1);
+      } else if (wgu.type == kTypeIq4Nl) {
+        WmmaGemm<kTypeIq4Nl><<<g1, kWmmaThreads, 0, stream>>>(a1);
       } else {
         WmmaGemm<kTypeQ8><<<g1, kWmmaThreads, 0, stream>>>(a1);
       }
@@ -3825,6 +3929,8 @@ struct Session::Impl : Scratch {
                                           c.situ_linear_beta);
       if (wdn.type == kTypeNvfp4) {
         WmmaGemm<kTypeNvfp4><<<g2, kWmmaThreads, 0, stream>>>(a2);
+      } else if (wdn.type == kTypeIq4Nl) {
+        WmmaGemm<kTypeIq4Nl><<<g2, kWmmaThreads, 0, stream>>>(a2);
       } else {
         WmmaGemm<kTypeQ8><<<g2, kWmmaThreads, 0, stream>>>(a2);
       }
@@ -4127,20 +4233,27 @@ struct Session::Impl : Scratch {
     }
     const float* msgs_ = nullptr;
     if (st.pass > 0) {
-      const std::uint32_t cc = st.ip - start;
-      const float* res =
-          static_cast<const float*>(m->T("loop_res_query.weight").dev);
-      const float* kv =
-          static_cast<const float*>(m->T("loop_kv_res_query.weight").dev);
-      float* mq = low;
-      HIP_OK(hipMemcpyAsync(mq, res + 2 * cc * h, h * 4,
-                            hipMemcpyDeviceToDevice, stream));
-      HIP_OK(hipMemcpyAsync(mq + h, kv + 2 * cc * h, h * 4,
-                            hipMemcpyDeviceToDevice, stream));
-      HIP_OK(hipMemcpyAsync(mq + 2 * h, kv + (2 * cc + 1) * h, h * 4,
-                            hipMemcpyDeviceToDevice, stream));
-      HIP_OK(hipMemcpyAsync(mq + 3 * h, res + (2 * cc + 1) * h, h * 4,
-                            hipMemcpyDeviceToDevice, stream));
+      const float* mq = nullptr;
+      const std::string per_layer_q = m->P(st.ip, "loop_msg_query.weight");
+      if (m->Has(per_layer_q)) {
+        mq = static_cast<const float*>(m->T(per_layer_q).dev);
+      } else {
+        const std::uint32_t cc = st.ip - start;
+        const float* res =
+            static_cast<const float*>(m->T("loop_res_query.weight").dev);
+        const float* kv =
+            static_cast<const float*>(m->T("loop_kv_res_query.weight").dev);
+        float* mq_buf = low;
+        HIP_OK(hipMemcpyAsync(mq_buf, res + 2 * cc * h, h * 4,
+                              hipMemcpyDeviceToDevice, stream));
+        HIP_OK(hipMemcpyAsync(mq_buf + h, kv + 2 * cc * h, h * 4,
+                              hipMemcpyDeviceToDevice, stream));
+        HIP_OK(hipMemcpyAsync(mq_buf + 2 * h, kv + (2 * cc + 1) * h, h * 4,
+                              hipMemcpyDeviceToDevice, stream));
+        HIP_OK(hipMemcpyAsync(mq_buf + 3 * h, res + (2 * cc + 1) * h, h * 4,
+                              hipMemcpyDeviceToDevice, stream));
+        mq = mq_buf;
+      }
       Mixer(R.bank, bank_out, mq, 4, R.n, msgs);
       msgs_ = msgs;
     }
@@ -4278,22 +4391,29 @@ struct Session::Impl : Scratch {
           Tap(v++, n);
           continue;
         }
-        // per-layer message queries (attn, k, v, ffn) from the global tables;
-        // see inkling-port-state.md
-        const std::uint32_t cc = ip - start;
-        const float* res =
-            static_cast<const float*>(m->T("loop_res_query.weight").dev);
-        const float* kv =
-            static_cast<const float*>(m->T("loop_kv_res_query.weight").dev);
-        float* mq = low;  // reuse as scratch: 4*h floats
-        HIP_OK(hipMemcpyAsync(mq, res + 2 * cc * h, h * 4,
-                              hipMemcpyDeviceToDevice, stream));
-        HIP_OK(hipMemcpyAsync(mq + h, kv + 2 * cc * h, h * 4,
-                              hipMemcpyDeviceToDevice, stream));
-        HIP_OK(hipMemcpyAsync(mq + 2 * h, kv + (2 * cc + 1) * h, h * 4,
-                              hipMemcpyDeviceToDevice, stream));
-        HIP_OK(hipMemcpyAsync(mq + 3 * h, res + (2 * cc + 1) * h, h * 4,
-                              hipMemcpyDeviceToDevice, stream));
+        const float* mq = nullptr;
+        const std::string per_layer_q = m->P(ip, "loop_msg_query.weight");
+        if (m->Has(per_layer_q)) {
+          mq = static_cast<const float*>(m->T(per_layer_q).dev);
+        } else {
+          // per-layer message queries (attn, k, v, ffn) from the global tables;
+          // see inkling-port-state.md
+          const std::uint32_t cc = ip - start;
+          const float* res =
+              static_cast<const float*>(m->T("loop_res_query.weight").dev);
+          const float* kv =
+              static_cast<const float*>(m->T("loop_kv_res_query.weight").dev);
+          float* mq_buf = low;  // reuse as scratch: 4*h floats
+          HIP_OK(hipMemcpyAsync(mq_buf, res + 2 * cc * h, h * 4,
+                                hipMemcpyDeviceToDevice, stream));
+          HIP_OK(hipMemcpyAsync(mq_buf + h, kv + 2 * cc * h, h * 4,
+                                hipMemcpyDeviceToDevice, stream));
+          HIP_OK(hipMemcpyAsync(mq_buf + 2 * h, kv + (2 * cc + 1) * h, h * 4,
+                                hipMemcpyDeviceToDevice, stream));
+          HIP_OK(hipMemcpyAsync(mq_buf + 3 * h, res + (2 * cc + 1) * h, h * 4,
+                                hipMemcpyDeviceToDevice, stream));
+          mq = mq_buf;
+        }
         Mixer(bank, bank_out, mq, 4, n, msgs);
         Layer(il, ip, blocks, msgs, n);
         Tap(v++, n);

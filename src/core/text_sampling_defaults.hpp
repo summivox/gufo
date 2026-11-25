@@ -40,7 +40,8 @@ inline TextModelPreset TextPreset(const core::ModelConfig& config) {
     return TextModelPreset::kDeepSeekV4Flash;
   if (config.architecture == "flint")
     return TextModelPreset::kFlint;
-  if (config.architecture == "inkling2")
+  if (config.architecture == "inkling2" ||
+      config.architecture == "inkling2_loop")
     return TextModelPreset::kInkling;
   if (config.architecture == "glm5next" || config.architecture == "glm5-next")
     return TextModelPreset::kGlm53Flash;

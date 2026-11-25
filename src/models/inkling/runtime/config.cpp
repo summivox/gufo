@@ -8,6 +8,7 @@ namespace gufo::models::inkling {
 namespace {
 
 constexpr std::string_view kArchitecture = "inkling2";
+constexpr std::string_view kLoopArchitecture = "inkling2_loop";
 
 struct Reader {
   const core::GgufReader& gguf;
@@ -103,16 +104,19 @@ std::optional<Config> ParseConfig(const core::GgufReader& reader,
                                   std::string* error_msg) {
   Reader r{reader, error_msg};
   const auto architecture = reader.GetMetadataString("general.architecture");
-  if (!architecture || *architecture != kArchitecture) {
+  if (!architecture ||
+      (*architecture != kArchitecture && *architecture != kLoopArchitecture)) {
     r.Fail("artifact is not inkling2");
     return std::nullopt;
   }
+  const bool loop_schema = *architecture == kLoopArchitecture;
 
   Config c;
-  const auto key = [](std::string_view name) {
-    return std::string(kArchitecture) + "." + std::string(name);
+  const std::string arch(*architecture);
+  const auto key = [&arch](std::string_view name) {
+    return arch + "." + std::string(name);
   };
-  c.num_layers = r.U32(key("block_count"));
+  const std::uint32_t block_count = r.U32(key("block_count"));
   c.context_length = r.U32(key("context_length"));
   c.hidden_size = r.U32(key("embedding_length"));
   c.dense_ff = r.U32(key("feed_forward_length"));
@@ -123,10 +127,15 @@ std::optional<Config> ParseConfig(const core::GgufReader& reader,
   c.expert_used = r.U32(key("expert_used_count"));
   c.expert_ff = r.U32(key("expert_feed_forward_length"));
   c.sliding_window = r.U32(key("attention.sliding_window"));
-  c.loop_num_loops = r.U32(key("num_loops"));
-  c.loop_core_start = r.U32(key("loop.core_start"));
-  c.loop_core_end = r.U32(key("loop.core_end"));
+  c.loop_num_loops = r.U32(key(loop_schema ? "loop.count" : "num_loops"));
+  c.loop_core_start =
+      r.U32(key(loop_schema ? "loop.start" : "loop.core_start"));
+  c.loop_core_end = r.U32(key(loop_schema ? "loop.end" : "loop.core_end"));
   c.loop_gate_rank = r.U32(key("loop.gate_rank"));
+  if (loop_schema &&
+      reader.GetMetadataBool(key("loop.varying")).value_or(false)) {
+    r.Fail("Inkling: variable loop count is not supported");
+  }
   c.attn_res_block_size = r.U32(key("attn_res.block_size"));
   c.shortconv_l_cache = r.U32(key("shortconv.l_cache"));
   c.relative_length = r.U32(key("attention.relative_length"));
@@ -144,7 +153,32 @@ std::optional<Config> ParseConfig(const core::GgufReader& reader,
   c.vocab_unpadded = r.U32(key("vocab_size_unpadded"));
   c.rope_dimension_count = r.U32(key("rope.dimension_count"));
   c.has_relative = c.relative_length > 0;
-  c.is_swa = r.BoolArray(key("attention.sliding_window_pattern"));
+  std::vector<bool> raw_swa =
+      r.BoolArray(key("attention.sliding_window_pattern"));
+  if (loop_schema) {
+    if (c.loop_num_loops == 0 || c.loop_core_start >= c.loop_core_end ||
+        c.loop_core_end > block_count) {
+      r.Fail("Inkling: invalid loop range in inkling2_loop metadata");
+      return std::nullopt;
+    }
+    const std::uint32_t span = c.loop_core_end - c.loop_core_start;
+    c.num_layers = block_count + (c.loop_num_loops - 1) * span;
+    if (raw_swa.size() != block_count) {
+      Expect(r, "sliding_window_pattern entries", raw_swa.size(), block_count);
+    } else {
+      c.is_swa.resize(c.num_layers);
+      for (std::uint32_t slot = 0; slot < c.num_layers; ++slot) {
+        const std::uint32_t phys =
+            slot < block_count
+                ? slot
+                : c.loop_core_start + (slot - block_count) % span;
+        c.is_swa[slot] = raw_swa[phys];
+      }
+    }
+  } else {
+    c.num_layers = block_count;
+    c.is_swa = std::move(raw_swa);
+  }
 
   Expect(r, "block_count", c.num_layers, 48);
   Expect(r, "embedding_length", c.hidden_size, 2304);
